@@ -239,18 +239,13 @@ const openingMessage = (s: AgentStoreState) => currentAgentConfig(s)?.openingMes
 // ==========   Agent Mode Config   ============== //
 
 /**
- * Get current agent's mode
- * Now reads from chatConfig.agentMode and chatConfig.enableAgentMode
+ * Get current agent's mode.
+ * Agent mode is the default — only an explicit `chatConfig.enableAgentMode === false`
+ * collapses the agent to chat mode.
  */
 const currentAgentMode = (s: AgentStoreState): AgentMode | undefined => {
-  const config = currentAgentConfig(s);
-
-  // Fallback: convert enableAgentMode to mode
-  if (config?.enableAgentMode) {
-    return 'auto';
-  }
-
-  return undefined;
+  const chatConfig = currentAgentConfig(s)?.chatConfig;
+  return chatConfig?.enableAgentMode === false ? undefined : 'auto';
 };
 
 /**
@@ -291,6 +286,9 @@ const isCurrentAgentExternal = (s: AgentStoreState): boolean => !currentAgentDat
 const isCurrentAgentHeterogeneous = (s: AgentStoreState): boolean =>
   !!currentAgentConfig(s)?.agencyConfig?.heterogeneousProvider;
 
+const canCurrentAgentPublishToCommunity = (s: AgentStoreState): boolean =>
+  !!currentAgentData(s) && !isCurrentAgentHeterogeneous(s);
+
 const currentAgentHeterogeneousProviderType = (s: AgentStoreState) =>
   currentAgentConfig(s)?.agencyConfig?.heterogeneousProvider?.type;
 
@@ -298,6 +296,7 @@ const getAgentDocumentsById = (agentId: string) => (s: AgentStoreState) =>
   s.agentDocumentsMap[agentId];
 
 export const agentSelectors = {
+  canCurrentAgentPublishToCommunity,
   currentAgentHeterogeneousProviderType,
   currentAgentAvatar,
   currentAgentBackgroundColor,

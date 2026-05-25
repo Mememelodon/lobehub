@@ -8,7 +8,13 @@ import { AgentRuntime, findInMessages, GeneralChatAgent } from '@lobechat/agent-
 import type { ISnapshotStore } from '@lobechat/agent-tracing';
 import { dynamicInterventionAudits } from '@lobechat/builtin-tools/dynamicInterventionAudits';
 import { getModelPropertyWithFallback } from '@lobechat/model-runtime';
-import { AgentRuntimeErrorType, ChatErrorType, type ChatMessageError } from '@lobechat/types';
+import {
+  AgentRuntimeErrorType,
+  ChatErrorType,
+  type ChatMessageError,
+  type ExecSubAgentTaskParams,
+  type UIChatMessage,
+} from '@lobechat/types';
 import debug from 'debug';
 import urlJoin from 'url-join';
 
@@ -17,12 +23,15 @@ import { type LobeChatDatabase } from '@/database/type';
 import { appEnv } from '@/envs/app';
 import { type AgentRuntimeCoordinatorOptions } from '@/server/modules/AgentRuntime';
 import { AgentRuntimeCoordinator, createStreamEventManager } from '@/server/modules/AgentRuntime';
-import { type RuntimeExecutorContext } from '@/server/modules/AgentRuntime/RuntimeExecutors';
-import { createRuntimeExecutors } from '@/server/modules/AgentRuntime/RuntimeExecutors';
+import {
+  createRuntimeExecutors,
+  type RuntimeExecutorContext,
+} from '@/server/modules/AgentRuntime/RuntimeExecutors';
 import { type IStreamEventManager } from '@/server/modules/AgentRuntime/types';
 import { emitAgentSignalSourceEvent } from '@/server/services/agentSignal';
 import { toAgentSignalTraceEvents } from '@/server/services/agentSignal/observability/traceEvents';
 import { mcpService } from '@/server/services/mcp';
+import { MessageService } from '@/server/services/message';
 import { QueueService } from '@/server/services/queue';
 import { LocalQueueServiceImpl } from '@/server/services/queue/impls';
 import { ToolExecutionService } from '@/server/services/toolExecution';
@@ -117,6 +126,12 @@ export interface AgentRuntimeServiceOptions {
    */
   coordinatorOptions?: AgentRuntimeCoordinatorOptions;
   /**
+   * Callback to spawn a sub-agent task from within a running server-side agent.
+   * Injected by AiAgentService to wire up the exec_task / exec_tasks executors
+   * without creating a circular import between RuntimeExecutors and AiAgentService.
+   */
+  execSubAgentTask?: (params: ExecSubAgentTaskParams) => Promise<unknown>;
+  /**
    * Custom QueueService
    * Set to null to disable queue scheduling (for synchronous execution tests)
    */
@@ -155,6 +170,7 @@ export class AgentRuntimeService {
   private agentFactory?: (config: GeneralAgentConfig) => Agent;
   private completionLifecycle: CompletionLifecycle;
   private coordinator: AgentRuntimeCoordinator;
+  private execSubAgentTaskCallback?: (params: ExecSubAgentTaskParams) => Promise<unknown>;
   private humanIntervention: HumanInterventionHandler;
   private streamManager: IStreamEventManager;
   private queueService: QueueService | null;
@@ -168,6 +184,17 @@ export class AgentRuntimeService {
   private serverDB: LobeChatDatabase;
   private userId: string;
   private messageModel: MessageModel;
+  // Lazily constructed because MessageService instantiates a FileService
+  // which eagerly creates the S3 client and throws when S3 env vars are
+  // missing — eager construction would break every test that builds an
+  // AgentRuntimeService without mocking the file backend.
+  private messageServiceInstance?: MessageService;
+  private get messageService(): MessageService {
+    if (!this.messageServiceInstance) {
+      this.messageServiceInstance = new MessageService(this.serverDB, this.userId);
+    }
+    return this.messageServiceInstance;
+  }
 
   constructor(db: LobeChatDatabase, userId: string, options?: AgentRuntimeServiceOptions) {
     // Use factory function to auto-select Redis or InMemory implementation
@@ -178,6 +205,10 @@ export class AgentRuntimeService {
     this.coordinator = new AgentRuntimeCoordinator({
       ...options?.coordinatorOptions,
       streamEventManager: this.streamManager,
+      // Provide the canonical UIChatMessage[] for terminal-state events so
+      // the client can use the pushed payload directly instead of refetching
+      // from DB. Falls back gracefully when topicId isn't set.
+      uiMessagesResolver: (state) => this.queryUiMessages(state),
     });
     this.queueService =
       options?.queueService === null ? null : (options?.queueService ?? new QueueService());
@@ -185,6 +216,7 @@ export class AgentRuntimeService {
       options?.snapshotStore ?? this.createDefaultSnapshotStore(),
     );
     this.agentFactory = options?.agentFactory;
+    this.execSubAgentTaskCallback = options?.execSubAgentTask;
     this.serverDB = db;
     this.userId = userId;
     this.messageModel = new MessageModel(db, this.userId);
@@ -460,6 +492,31 @@ export class AgentRuntimeService {
   }
 
   /**
+   * Query the canonical UIChatMessage[] snapshot for the active topic — the
+   * same shape the `message.getMessages` trpc lambda returns to the client.
+   * Attached to step_start / agent_runtime_end stream events so the client
+   * can use the pushed payload directly instead of refetching from DB.
+   *
+   * Returns undefined when the topic isn't known yet (e.g. very early in
+   * bootstrap before the topic row has been committed) so callers can skip
+   * the `uiMessages` field entirely instead of pushing an empty array.
+   */
+  async queryUiMessages(agentState: AgentState): Promise<UIChatMessage[] | undefined> {
+    const agentId: string | undefined = agentState?.metadata?.agentId;
+    const topicId: string | undefined = agentState?.metadata?.topicId;
+    if (!agentId || !topicId) return undefined;
+
+    try {
+      return await this.messageService.queryMessages({ agentId, topicId });
+    } catch (error) {
+      // Stream events must never fail the step. If the DB hiccups, fall back
+      // to letting the client refresh as before.
+      console.error('[queryUiMessages] Failed to load uiMessages snapshot: %O', error);
+      return undefined;
+    }
+  }
+
+  /**
    * Execute Agent step
    */
   async executeStep(params: AgentExecutionParams): Promise<AgentExecutionResult> {
@@ -500,19 +557,26 @@ export class AgentRuntimeService {
     try {
       log('[%s][%d] Start step executing...', operationId, stepIndex);
 
-      // Publish step start event
-      await this.streamManager.publishStreamEvent(operationId, {
-        data: {},
-        stepIndex,
-        type: 'step_start',
-      });
-
-      // Get operation state and metadata
+      // Load agent state BEFORE publishing step_start so we can attach the
+      // canonical UIChatMessage snapshot to the event payload. step_start
+      // fires after the previous step's DB writes are awaited durable, so
+      // the snapshot query here reflects strongly-consistent state — that's
+      // the contract that lets the client treat the pushed uiMessages as
+      // the source of truth instead of doing its own refetch.
       const agentState = await this.coordinator.loadAgentState(operationId);
 
       if (!agentState) {
         throw new Error(`Agent state not found for operation ${operationId}`);
       }
+
+      const stepStartUiMessages = await this.queryUiMessages(agentState);
+      await this.streamManager.publishStreamEvent(operationId, {
+        data: {
+          ...(stepStartUiMessages !== undefined && { uiMessages: stepStartUiMessages }),
+        },
+        stepIndex,
+        type: 'step_start',
+      });
 
       agentState.metadata = {
         ...agentState.metadata,
@@ -607,6 +671,17 @@ export class AgentRuntimeService {
         log('[%s] beforeStep hook dispatch error: %O', operationId, hookError);
       }
 
+      // Per-step buffer for context engine input/output. Populated by the
+      // `tracingContextEngine` callback passed into the executor context;
+      // consumed by traceRecorder.appendStep below. Routing CE this way keeps
+      // its heavy payload (agentDocuments, systemRole, …) out of
+      // `stepResult.events` and therefore out of the Redis state pipeline.
+      //
+      // Context: contextEngine.input (agentDocuments) was ~2.7MB/step,
+      // hitting Upstash Redis 10MB limit. Bypassing events keeps the heavy
+      // payload in trace only, reducing per-step Redis state by ~500x.
+      let contextEnginePayload: { input: unknown; output: unknown } | undefined;
+
       // Create Agent and Runtime instances
       // Use agentState.metadata which contains the full app context (topicId, agentId, etc.)
       // operationMetadata only contains basic fields (agentConfig, modelRuntimeConfig, userId)
@@ -614,6 +689,9 @@ export class AgentRuntimeService {
         metadata: agentState?.metadata,
         operationId,
         stepIndex,
+        tracingContextEngine: (input, output) => {
+          contextEnginePayload = { input, output };
+        },
       });
 
       // Handle human intervention
@@ -785,6 +863,7 @@ export class AgentRuntimeService {
         afterStepSignalEvents,
         agentState,
         beforeStepSignalEvents,
+        contextEngine: contextEnginePayload,
         currentContext,
         externalRetryCount,
         presentation: stepPresentationData,
@@ -860,7 +939,7 @@ export class AgentRuntimeService {
 
         // Finalize tracing snapshot. The error catch below uses the same
         // recorder so propagated failures still write the canonical S3
-        // snapshot instead of orphaning the partial (LOBE-8533).
+        // snapshot instead of orphaning the partial ().
         await this.traceRecorder.finalize(operationId, {
           appendEventsToLastStep: completionSignalEvents,
           completionReason: reason,
@@ -951,9 +1030,9 @@ export class AgentRuntimeService {
       // failed op is observable in the same place as a successful run.
       // Without this, propagated errors (e.g. markPersistFatal from
       // RuntimeExecutors) leave the partial as an orphan at
-      // `_partial/<op>.json` and the canonical
-      // `agent-traces/<agentId>/<topicId>/<op>.json` returns 404 — see
-      // LOBE-8533.
+      // `_partial/<op>.json.zst` and the canonical
+      // `agent-traces/<agentId>/<topicId>/<op>.json.zst` returns 404 — see
+      // .
       //
       // `failedStep` synthesizes a step record for the failure because the
       // real step never reached `appendStepToPartial` — it threw before the
@@ -1322,10 +1401,12 @@ export class AgentRuntimeService {
     metadata,
     operationId,
     stepIndex,
+    tracingContextEngine,
   }: {
     metadata?: any;
     operationId: string;
     stepIndex: number;
+    tracingContextEngine?: (input: unknown, output: unknown) => void;
   }) {
     const contextWindowTokens =
       metadata?.modelRuntimeConfig?.model && metadata?.modelRuntimeConfig?.provider
@@ -1360,6 +1441,7 @@ export class AgentRuntimeService {
       discordContext: metadata?.discordContext,
       userTimezone: metadata?.userTimezone,
       evalContext: metadata?.evalContext,
+      execSubAgentTask: this.execSubAgentTaskCallback,
       hookDispatcher,
       loadAgentState: this.coordinator.loadAgentState.bind(this.coordinator),
       messageModel: this.messageModel,
@@ -1370,6 +1452,7 @@ export class AgentRuntimeService {
       streamManager: this.streamManager,
       toolExecutionService: this.toolExecutionService,
       topicId: metadata?.topicId,
+      tracingContextEngine,
       userId: metadata?.userId,
     };
 
