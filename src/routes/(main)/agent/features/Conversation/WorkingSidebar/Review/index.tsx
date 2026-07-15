@@ -1,15 +1,17 @@
 'use client';
 
+import type { GitWorkingTreePatch } from '@lobechat/electron-client-ipc';
 import { ActionIcon, Center, type DropdownItem, DropdownMenu, Empty, Flexbox } from '@lobehub/ui';
 import { createStaticStyles } from 'antd-style';
 import {
   ArrowLeftIcon,
   ChevronDownIcon,
-  ChevronRightIcon,
   Columns2Icon,
   FoldVerticalIcon,
   GitCompareIcon,
   MoreHorizontalIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
   RefreshCwIcon,
   RotateCcwIcon,
   Rows2Icon,
@@ -17,15 +19,33 @@ import {
   WholeWordIcon,
   WrapTextIcon,
 } from 'lucide-react';
-import { AnimatePresence, m } from 'motion/react';
-import { type KeyboardEvent, memo, useMemo, useState } from 'react';
+import path from 'path-browserify-esm';
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
 import { useLocalStorageState } from '@/hooks/useLocalStorageState';
+import { useFetchGitBranch } from '@/store/device';
 
-import FileItemBody, { FileItemHeader } from './FileItem';
-import { type ReviewMode, useGitRemoteBranches, useReviewPatches } from './useReviewPatches';
+import FileRow from './FileRow';
+import FileTreeNav from './FileTreeNav';
+import GroupHeader from './GroupHeader';
+import { itemKey } from './reviewTreeNodes';
+import {
+  invalidateGitReviewCaches,
+  type ReviewMode,
+  useGitRemoteBranches,
+  useReviewPatches,
+} from './useReviewPatches';
+
+interface RepoGroup {
+  absolutePath: string;
+  branch?: string;
+  detached?: boolean;
+  isParent: boolean;
+  name: string;
+  patches: GitWorkingTreePatch[];
+}
 
 const WORD_WRAP_STORAGE_KEY = 'lobechat-review-word-wrap';
 const TEXT_DIFF_STORAGE_KEY = 'lobechat-review-text-diff';
@@ -34,6 +54,16 @@ const REVIEW_MODE_STORAGE_KEY = 'lobechat-review-mode';
 const BASE_REF_OVERRIDES_STORAGE_KEY = 'lobechat-review-base-overrides';
 
 interface ReviewProps {
+  active: boolean;
+  /**
+   * Target device the working directory lives on. Undefined for local desktop;
+   * set for a remote / web-bound device so git ops route through the device RPCs.
+   */
+  deviceId?: string;
+  /** Toggle the tree-nav rail. Owned by the sidebar so it can widen the panel. */
+  onToggleTree: () => void;
+  /** Whether the right-hand tree-nav rail is shown (two-pane). */
+  showTree: boolean;
   workingDirectory: string;
 }
 
@@ -41,9 +71,6 @@ interface ReviewProps {
 // either way keeps Shiki tokenization under ~250ms on first paint.
 const DEFAULT_EXPAND_BYTE_BUDGET = 100 * 1024;
 const DEFAULT_EXPAND_MAX_COUNT = 50;
-
-const itemKey = (entry: { filePath: string; status: string }) =>
-  `${entry.status}:${entry.filePath}`;
 
 const styles = createStaticStyles(({ css, cssVar }) => ({
   caret: css`
@@ -66,50 +93,31 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     font-size: 12px;
     font-variant-numeric: tabular-nums;
   `,
+  // Two-pane body: diff list (left, flexes) + tree-nav rail (right, fixed).
+  body: css`
+    overflow: hidden;
+    min-height: 0;
+  `,
   list: css`
+    position: relative;
+    min-width: 0;
     border-block: 1px solid ${cssVar.colorBorderSecondary};
-  `,
-  item: css`
-    /* Skip layout/paint of off-screen rows. Preserved from the previous
-       implementation. */
-    content-visibility: auto;
-    contain-intrinsic-size: auto 32px;
 
-    & + & {
-      border-block-start: 1px solid ${cssVar.colorBorderSecondary};
+    /* Strip the first visible row's own top border — the list's
+       border-block-start already provides the separator under the subheader,
+       so without this we'd render a doubled-up 2px line at the top. */
+    & > :first-child {
+      border-block-start: none;
     }
   `,
-  row: css`
-    cursor: pointer;
-    user-select: none;
-
-    display: flex;
-    gap: 6px;
-    align-items: center;
-
-    width: 100%;
-    padding-block: 5px;
-    padding-inline: 10px;
-
-    transition: background 0.12s;
-
-    &:hover {
-      background: ${cssVar.colorFillTertiary};
-    }
-
-    &:focus-visible {
-      outline: 2px solid ${cssVar.colorPrimary};
-      outline-offset: -2px;
-    }
-  `,
-  chevron: css`
+  treeRail: css`
     flex: none;
-    color: ${cssVar.colorTextTertiary};
-    transition: transform 0.2s;
 
-    &[data-expanded='true'] {
-      transform: rotate(90deg);
-    }
+    width: 240px;
+    min-height: 0;
+    padding-block: 4px;
+    border-block-start: 1px solid ${cssVar.colorBorderSecondary};
+    border-inline-start: 1px solid ${cssVar.colorBorderSecondary};
   `,
   arrow: css`
     flex-shrink: 0;
@@ -202,9 +210,21 @@ const styles = createStaticStyles(({ css, cssVar }) => ({
     padding-block: 4px 8px;
     padding-inline: 8px;
   `,
+  // Empty submodule group — pointer-only bump where the submodule's own
+  // working tree is clean. We still surface the group so the user knows the
+  // submodule pointer moved, just with a softer "no changes" line instead of
+  // a list of files.
+  groupEmpty: css`
+    padding-block: 6px 10px;
+    padding-inline: 10px;
+    border-block-start: 1px solid ${cssVar.colorBorderSecondary};
+
+    font-size: 12px;
+    color: ${cssVar.colorTextTertiary};
+  `,
 }));
 
-const Review = memo<ReviewProps>(({ workingDirectory }) => {
+const Review = memo<ReviewProps>(({ active, deviceId, onToggleTree, showTree, workingDirectory }) => {
   const { t } = useTranslation('chat');
   const [mode, setMode] = useLocalStorageState<ReviewMode>(REVIEW_MODE_STORAGE_KEY, 'unstaged');
   // Per-repo base-ref override — when set, the branch diff compares against
@@ -224,22 +244,49 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
     });
   };
 
-  const { data, isLoading, isValidating, mutate } = useReviewPatches(
+  const { data, isLoading, isValidating } = useReviewPatches(
     workingDirectory,
     mode,
     baseOverride,
+    deviceId,
+    active,
   );
+  const invalidateReviewData = useCallback(
+    async () =>
+      invalidateGitReviewCaches({
+        baseRef: baseOverride,
+        deviceId,
+        dirPath: workingDirectory,
+        mode,
+      }),
+    [baseOverride, deviceId, mode, workingDirectory],
+  );
+
+  useEffect(() => {
+    if (!active) return;
+    void invalidateReviewData();
+  }, [active, invalidateReviewData]);
   // Lazy: only fetch remote branches list once the user opens the picker.
   const [basePickerOpen, setBasePickerOpen] = useState(false);
   const { data: remoteBranches } = useGitRemoteBranches(
     workingDirectory,
     mode === 'branch' && basePickerOpen,
+    deviceId,
   );
   // Memo-stabilise the fallback so downstream useMemo deps don't flap on
   // every render while the SWR result is undefined.
   const patches = useMemo(() => data?.patches ?? [], [data]);
+  const submoduleGroups = useMemo(() => data?.submodules ?? [], [data]);
   const baseRef = data?.mode === 'branch' ? data.baseRef : undefined;
   const headRef = data?.mode === 'branch' ? data.headRef : undefined;
+  // Parent branch — only needed for the group header label, so we only fetch
+  // it when there's at least one submodule group to render alongside it.
+  // SWR-deduped under the hood by `useFetchGitBranch`'s own cache key. Routes
+  // through the target device so remote repos resolve the same way.
+  const { data: parentGitInfo } = useFetchGitBranch(
+    deviceId,
+    submoduleGroups.length > 0 ? workingDirectory : undefined,
+  );
   const [viewMode, setViewMode] = useLocalStorageState<'unified' | 'split'>(
     VIEW_MODE_STORAGE_KEY,
     'unified',
@@ -249,29 +296,107 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
   // so we default the persisted toggle to true to preserve current behaviour.
   const [textDiff, setTextDiff] = useLocalStorageState<boolean>(TEXT_DIFF_STORAGE_KEY, true);
 
-  // Default-expand by patch-size budget: take entries until cumulative patch
-  // bytes exceed DEFAULT_EXPAND_BYTE_BUDGET, capped at DEFAULT_EXPAND_MAX_COUNT.
-  // Every PatchDiff mounts a Shiki tokenizer synchronously, so expanding too
-  // much at once locks the renderer; size-based budget keeps small-diff cases
-  // generous while clamping repos with a few large refactors. Re-syncing on
-  // signature change auto-expands new entries within the cap; panels the user
-  // manually closed earlier stay closed because their key is already absent.
-  const signature = useMemo(() => patches.map(itemKey).join('|'), [patches]);
+  // Build the per-repo group list. The parent always comes first; submodules
+  // follow in the order the IPC returned them (which is the order they appear
+  // in `git status`). The parent group is dropped when it has zero patches
+  // *and* at least one submodule exists — we don't want an empty parent
+  // header hovering above the submodule rows. Submodule groups with zero
+  // patches (pointer-only bumps) are intentionally kept so the user still
+  // sees the submodule surfaced.
+  const groups = useMemo<RepoGroup[]>(() => {
+    const result: RepoGroup[] = [];
+    if (patches.length > 0 || submoduleGroups.length === 0) {
+      result.push({
+        absolutePath: workingDirectory,
+        branch: parentGitInfo?.branch,
+        detached: parentGitInfo?.detached,
+        isParent: true,
+        name: path.basename(workingDirectory) || workingDirectory,
+        patches,
+      });
+    }
+    for (const sub of submoduleGroups) {
+      result.push({
+        absolutePath: sub.absolutePath,
+        branch: sub.branch,
+        detached: sub.detached,
+        isParent: false,
+        name: sub.name,
+        patches: sub.patches,
+      });
+    }
+    return result;
+  }, [workingDirectory, parentGitInfo?.branch, parentGitInfo?.detached, patches, submoduleGroups]);
+  const showGroupHeaders = submoduleGroups.length > 0;
+  const allEntries = useMemo(
+    () => groups.flatMap((g) => g.patches.map((p) => ({ group: g, patch: p }))),
+    [groups],
+  );
+  // Per-group collapse state — ephemeral (not persisted across reloads).
+  // Stored as a set of repo absolutePaths; entries linger if a group later
+  // disappears, which is harmless since nothing renders for missing paths.
+  const [collapsedGroupPaths, setCollapsedGroupPaths] = useState<Set<string>>(() => new Set());
+  const toggleGroupCollapsed = (absolutePath: string) => {
+    setCollapsedGroupPaths((prev) => {
+      const next = new Set(prev);
+      if (next.has(absolutePath)) next.delete(absolutePath);
+      else next.add(absolutePath);
+      return next;
+    });
+  };
+
+  // Default-expand by patch-size budget: take entries (across all groups in
+  // order) until cumulative patch bytes exceed DEFAULT_EXPAND_BYTE_BUDGET,
+  // capped at DEFAULT_EXPAND_MAX_COUNT. Every PatchDiff mounts a Shiki
+  // tokenizer synchronously, so expanding too much at once locks the renderer;
+  // size-based budget keeps small-diff cases generous while clamping repos
+  // with a few large refactors. Re-syncing on signature change auto-expands
+  // new entries within the cap; panels the user manually closed earlier stay
+  // closed because their key is already absent.
+  const signature = useMemo(
+    () => allEntries.map(({ group, patch }) => itemKey(group.absolutePath, patch)).join('|'),
+    [allEntries],
+  );
   const [seenSignature, setSeenSignature] = useState('');
   const [activeKeys, setActiveKeys] = useState<string[]>([]);
   if (signature !== seenSignature) {
     setSeenSignature(signature);
     const initialKeys: string[] = [];
     let budget = DEFAULT_EXPAND_BYTE_BUDGET;
-    for (const entry of patches) {
+    for (const { group, patch } of allEntries) {
       if (initialKeys.length >= DEFAULT_EXPAND_MAX_COUNT) break;
-      const cost = entry.patch?.length ?? 0;
+      const cost = patch.patch?.length ?? 0;
       if (initialKeys.length > 0 && cost > budget) break;
-      initialKeys.push(itemKey(entry));
+      initialKeys.push(itemKey(group.absolutePath, patch));
       budget -= cost;
     }
     setActiveKeys(initialKeys);
   }
+
+  // The file whose diff the tree-nav last scrolled to — highlighted in the rail.
+  const [activeFileKey, setActiveFileKey] = useState<string | undefined>();
+  // Scroll container for the left diff list; tree-nav clicks scroll it to the
+  // matching `[data-file-key]` row.
+  const listRef = useRef<HTMLDivElement>(null);
+  const toggleFileKey = (key: string) =>
+    setActiveKeys((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+  // Tree-nav → diff list: reveal the group, expand the file, scroll it into view.
+  const handleSelectFile = (key: string) => {
+    setActiveFileKey(key);
+    const groupPath = key.slice(0, key.indexOf('|'));
+    setCollapsedGroupPaths((prev) => {
+      if (!prev.has(groupPath)) return prev;
+      const next = new Set(prev);
+      next.delete(groupPath);
+      return next;
+    });
+    setActiveKeys((prev) => (prev.includes(key) ? prev : [...prev, key]));
+    // Defer until the row is mounted/uncollapsed, then scroll it to the top.
+    requestAnimationFrame(() => {
+      const el = listRef.current?.querySelector(`[data-file-key="${CSS.escape(key)}"]`);
+      el?.scrollIntoView({ block: 'start' });
+    });
+  };
 
   if (!data && isLoading) {
     return (
@@ -281,15 +406,18 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
     );
   }
 
-  const allExpanded = patches.length > 0 && activeKeys.length === patches.length;
+  const totalEntryCount = allEntries.length;
+  const allExpanded = totalEntryCount > 0 && activeKeys.length === totalEntryCount;
   const handleToggleAll = () => {
-    setActiveKeys(allExpanded ? [] : patches.map(itemKey));
+    setActiveKeys(
+      allExpanded ? [] : allEntries.map(({ group, patch }) => itemKey(group.absolutePath, patch)),
+    );
   };
 
-  const totals = patches.reduce(
-    (acc, entry) => {
-      acc.additions += entry.additions ?? 0;
-      acc.deletions += entry.deletions ?? 0;
+  const totals = allEntries.reduce(
+    (acc, { patch }) => {
+      acc.additions += patch.additions ?? 0;
+      acc.deletions += patch.deletions ?? 0;
       return acc;
     },
     { additions: 0, deletions: 0 },
@@ -300,7 +428,7 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
       icon: <RefreshCwIcon size={14} />,
       key: 'refresh',
       label: t('workingPanel.review.refresh'),
-      onClick: () => void mutate(),
+      onClick: () => void invalidateReviewData(),
     },
     { type: 'divider' },
     {
@@ -376,7 +504,10 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
         },
       ];
 
-  const isEmpty = patches.length === 0;
+  // A pointer-only submodule bump produces a group with no file patches but is
+  // still worth surfacing (the GroupHeader + "submodule clean" line), so don't
+  // collapse into the global empty state when any submodule group is present.
+  const isEmpty = totalEntryCount === 0 && submoduleGroups.length === 0;
   const emptyText =
     mode === 'branch'
       ? baseRef
@@ -435,7 +566,7 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
           )}
         </Flexbox>
         <Flexbox horizontal align={'center'} gap={2}>
-          {!isEmpty && (
+          {totalEntryCount > 0 && (
             <ActionIcon
               icon={allExpanded ? FoldVerticalIcon : UnfoldVerticalIcon}
               size={'small'}
@@ -445,6 +576,17 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
                   : t('workingPanel.review.expandAll')
               }
               onClick={handleToggleAll}
+            />
+          )}
+          {totalEntryCount > 0 && (
+            <ActionIcon
+              active={showTree}
+              icon={showTree ? PanelRightCloseIcon : PanelRightOpenIcon}
+              size={'small'}
+              title={
+                showTree ? t('workingPanel.review.tree.hide') : t('workingPanel.review.tree.show')
+              }
+              onClick={onToggleTree}
             />
           )}
           <DropdownMenu items={moreMenuItems} placement={'bottomRight'}>
@@ -462,74 +604,92 @@ const Review = memo<ReviewProps>(({ workingDirectory }) => {
           <Empty description={emptyText} icon={GitCompareIcon} />
         </Center>
       ) : (
-        <Flexbox className={styles.list} style={{ overflow: 'auto' }} width={'100%'}>
-          {patches.map((entry) => {
-            const key = itemKey(entry);
-            const expanded = activeKeys.includes(key);
-            const toggle = () =>
-              setActiveKeys((prev) =>
-                prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key],
+        <Flexbox horizontal className={styles.body} flex={1} width={'100%'}>
+          <Flexbox className={styles.list} flex={1} ref={listRef} style={{ overflow: 'auto' }}>
+            {groups.map((group) => {
+              const groupTotals = group.patches.reduce(
+                (acc, p) => {
+                  acc.additions += p.additions ?? 0;
+                  acc.deletions += p.deletions ?? 0;
+                  return acc;
+                },
+                { additions: 0, deletions: 0 },
               );
-            const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-              if (e.key === 'Enter' || e.key === ' ') {
-                e.preventDefault();
-                toggle();
-              }
-            };
-            return (
-              <div className={styles.item} key={key}>
-                <div
-                  data-review-row
-                  aria-expanded={expanded}
-                  className={styles.row}
-                  role={'button'}
-                  tabIndex={0}
-                  onClick={toggle}
-                  onKeyDown={onKeyDown}
-                >
-                  <ChevronRightIcon
-                    className={styles.chevron}
-                    data-expanded={expanded ? 'true' : 'false'}
-                    size={14}
-                  />
-                  <FileItemHeader
-                    additions={entry.additions}
-                    deletions={entry.deletions}
-                    filePath={entry.filePath}
-                    revertContext={mode === 'unstaged' ? { workingDirectory } : undefined}
-                    status={entry.status}
-                    onReverted={() => void mutate()}
-                  />
-                </div>
-                <AnimatePresence initial={false}>
-                  {expanded && (
-                    <m.div
-                      animate={'open'}
-                      exit={'collapsed'}
-                      initial={'collapsed'}
-                      style={{ overflow: 'hidden' }}
-                      transition={{ duration: 0.2, ease: [0.4, 0, 0.2, 1] }}
-                      variants={{
-                        collapsed: { height: 0, opacity: 0 },
-                        open: { height: 'auto', opacity: 1 },
-                      }}
-                    >
-                      <FileItemBody
-                        expanded
-                        filePath={entry.filePath}
-                        isBinary={entry.isBinary}
-                        patch={entry.patch}
-                        textDiff={textDiff}
-                        truncated={entry.truncated}
-                        viewMode={viewMode}
-                        wordWrap={wordWrap}
-                      />
-                    </m.div>
+              const groupCollapsed = collapsedGroupPaths.has(group.absolutePath);
+              const groupItemKeys = group.patches.map((p) => itemKey(group.absolutePath, p));
+              const groupAllExpanded =
+                groupItemKeys.length > 0 && groupItemKeys.every((k) => activeKeys.includes(k));
+              const toggleGroupDiffs = () => {
+                setActiveKeys((prev) => {
+                  if (groupAllExpanded) {
+                    const set = new Set(groupItemKeys);
+                    return prev.filter((k) => !set.has(k));
+                  }
+                  const next = new Set(prev);
+                  for (const k of groupItemKeys) next.add(k);
+                  return Array.from(next);
+                });
+              };
+              return (
+                <Fragment key={group.absolutePath}>
+                  {showGroupHeaders && (
+                    <GroupHeader
+                      branch={group.branch}
+                      collapsed={groupCollapsed}
+                      diffsAllExpanded={groupAllExpanded}
+                      hideFoldButton={groupCollapsed || group.patches.length === 0}
+                      name={group.name}
+                      patchCount={group.patches.length}
+                      totalAdditions={groupTotals.additions}
+                      totalDeletions={groupTotals.deletions}
+                      onToggleCollapsed={() => toggleGroupCollapsed(group.absolutePath)}
+                      onToggleDiffs={toggleGroupDiffs}
+                    />
                   )}
-                </AnimatePresence>
-              </div>
-            );
-          })}
+                  {showGroupHeaders &&
+                    !groupCollapsed &&
+                    !group.isParent &&
+                    group.patches.length === 0 && (
+                      <div className={styles.groupEmpty}>
+                        {t('workingPanel.review.group.submoduleClean')}
+                      </div>
+                    )}
+                  {!groupCollapsed &&
+                    group.patches.length > 0 &&
+                    group.patches.map((entry) => {
+                      const key = itemKey(group.absolutePath, entry);
+                      const expanded = activeKeys.includes(key);
+                      return (
+                        <FileRow
+                          dataFileKey={key}
+                          deviceId={deviceId}
+                          entry={entry}
+                          expanded={expanded}
+                          key={key}
+                          mode={mode}
+                          repoAbsolutePath={group.absolutePath}
+                          textDiff={textDiff}
+                          viewMode={viewMode}
+                          wordWrap={wordWrap}
+                          onReverted={() => void invalidateReviewData()}
+                          onToggle={() => toggleFileKey(key)}
+                        />
+                      );
+                    })}
+                </Fragment>
+              );
+            })}
+          </Flexbox>
+          {showTree && (
+            <Flexbox className={styles.treeRail}>
+              <FileTreeNav
+                activeFileKey={activeFileKey}
+                groups={groups}
+                showGroupHeaders={showGroupHeaders}
+                onSelectFile={handleSelectFile}
+              />
+            </Flexbox>
+          )}
         </Flexbox>
       )}
     </Flexbox>
